@@ -1,256 +1,186 @@
 # MCP-DayOne
 
-A Model Context Protocol (MCP) server for Day One Journal integration with Claude Desktop.
+## 1. Project Overview
 
-## Overview
+MCP-DayOne is a Model Context Protocol (MCP) server that connects Claude to a local Day One
+journal on macOS. It exposes ten tools: three that create entries, five that read and search
+them, and two legacy stubs that explain CLI limitations. Writes go through the `dayone`
+command-line binary bundled inside the Day One app; reads go directly against Day One's
+Core Data SQLite database, which is far faster and supports queries the CLI cannot express.
 
-This MCP server enables Claude Desktop to interact with your Day One journal through the Model Context Protocol. Claude can create journal entries, list available journals, and get entry counts directly through natural conversation.
+Every write is verified after the fact. The server reads back which journal the entry
+actually landed in, confirms whether Day One has uploaded it to the sync server, and
+guarantees the Day One app is running so that upload can happen at all.
 
-## Features
+## 2. Purpose
 
-### ✍️ **Write Operations (Day One CLI)**
-- 📝 Create journal entries with rich content and metadata
-- 📎 Add attachments (photos, videos, audio, PDFs) to entries
-- ⭐ Mark entries as starred/important
-- 📍 Add location coordinates to entries
-- 🕐 Enhanced date/time handling with timezone support
+Day One has no public API. The bundled CLI can create an entry but cannot list journals,
+count entries, search text, or report whether anything succeeded beyond returning a UUID.
+That makes unattended automation risky: a scheduled job can "succeed" while silently
+writing to the wrong journal, or while writing an entry that never leaves the machine.
 
-### 📖 **Read Operations (Direct Database Access)**
-- 📖 **NEW**: Read recent journal entries with full metadata
-- 🔍 **NEW**: Search entries by text content
-- 📚 **NEW**: List actual journals with entry counts and statistics
-- 📊 **NEW**: Get real entry counts from database
-- 🏷️ **NEW**: View entry tags, dates, and metadata
+This server closes both gaps so that scheduled captures — daily briefings, trading journals,
+email digests — can run without a human watching. Without it, you would be trusting an exit
+code that does not mean what it appears to mean.
 
-### 🔧 **Technical**
-- Proper error handling and validation
-- Direct SQLite database integration for read operations
-- Hybrid approach: CLI for writing, database for reading
-- 🚀 Easy installation with `uv`
+## 3. Features
 
-## Prerequisites
+**Entry creation with metadata.** Create entries with tags, explicit dates and timezones,
+starred status, GPS coordinates, all-day flags, and up to ten attachments (photos, video,
+audio, PDF).
 
-- **Day One CLI** (`dayone2`) - [Install from Day One website](https://dayoneapp.com/guides/tips-and-tutorials/command-line-interface-cli)
-- **Python 3.11+** 
-- **uv** - [Install from astral.sh](https://astral.sh/uv/install.sh)
+**Journal placement verification.** The CLI returns success and a UUID even when an entry
+lands in a different journal than the one requested. After each write the server reads the
+database back and reports `OK`, `MISPLACED`, or `UNVERIFIED`. On a mismatch it states
+explicitly that the write succeeded and must not be retried — retrying is how one misplaced
+entry becomes two.
 
-## Installation
+**Automatic sync activation.** Day One's sync engine runs inside the *main app*, not inside
+the always-running `com.bloombuilt.dayone-mac-agent` background process. A CLI write made
+while the main app is closed produces an entry that exists only on that Mac, invisible on
+every other device, until someone happens to open Day One. After each write the server
+launches the app in the background (`open -g -b com.bloombuilt.dayone-mac`), which is a
+no-op if it is already running and never steals focus from the user.
 
-### ⚡ **Quick Start (5 minutes)**
+**Sync verification.** `ZREMOTEENTRY` is Day One's mirror of what the sync server has
+acknowledged. A row in `ZENTRY` with no matching `ZREMOTEENTRY` row means written-locally,
+never-uploaded. The server checks this and reports `SYNCED`, `PENDING`, or `UNVERIFIED`.
 
-This MCP server is designed for **zero-configuration installation** - you only need to change one file path!
+**Watchdog-bounded verification.** Both verifications run on a daemon thread under a hard
+time ceiling. Immediately after a write — especially while the app is starting up — reads of
+`DayOne.sqlite` can block inside `open(2)` for minutes; a 14-minute stall was measured.
+SQLite's own `busy_timeout` cannot bound that, because the process never gets far enough to
+attempt a lock. Verification is a convenience and must never delay a write that already
+succeeded, so it is abandoned when it overruns its budget.
 
-### 1. Install Prerequisites (One-time setup)
+**Reading and search.** Read recent entries with full metadata, full-text search across
+entry content, list journals with real entry counts, and an "On This Day" lookup that
+retrieves entries from the same calendar date across previous years.
 
-**Day One CLI Installation:**
-1. Download and install Day One from the Mac App Store or Day One website
-2. The Day One CLI is **automatically included** with the app - no separate installation needed!
-3. Verify it's working: `dayone2 --version`
+**Resilient database reads.** Reads try the live database read-only with a short bounded
+wait, then fall back to a disposable snapshot copy that no other process can lock. The
+`-wal` sidecar is always copied with it — a just-written entry still lives in the
+write-ahead log and is invisible in a copy of the main file alone.
 
-**Python and uv:**
-```bash
-# Install uv package manager (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+## 4. File Descriptions
 
-# Verify Day One CLI is accessible
-dayone2 --version
+```
+src/mcp_dayone/server.py   — MCP server: tool schemas and the 10 request handlers
+src/mcp_dayone/tools.py    — DayOneTools: CLI wrapper, database reads, text extraction,
+                             placement/upload verification, app-launch logic
+src/mcp_dayone/__init__.py — Package marker
+test_setup.py              — Setup validation: CLI reachable, database readable, tools listed
+pyproject.toml             — Project metadata and Python dependencies
+uv.lock                    — Pinned dependency versions
+smithery.toml              — Smithery packaging configuration
+CLAUDE.md                  — Repository guidance for Claude Code sessions
+CONTRIBUTING.md            — Commit and README standards (canonical, source of truth)
+AGENTS.md                  — Agent-facing restatement of those standards
+CHANGELOG.md               — Dated record of notable changes
+README.md                  — This file
+LICENSE                    — MIT
 ```
 
-### 2. Clone and Setup (Automatic dependency management)
+## 5. How to Use
+
+**Prerequisites:** macOS with the Day One app installed and run at least once, Python 3.11+,
+and the `uv` package manager. The `dayone` CLI ships inside the app bundle and is symlinked
+at `/usr/local/bin/dayone`; no separate install is required. Verify with `dayone help`.
+
+**Setup:**
 
 ```bash
-git clone <repository-url>
 cd mcp-dayone
-uv sync  # Automatically installs all Python dependencies
-```
-
-### 3. Validate Installation (Built-in testing)
-
-```bash
-# Run comprehensive setup validation
+uv sync
 uv run python test_setup.py
 ```
 
-This test script automatically:
-- ✅ Verifies Day One CLI is accessible
-- ✅ Tests database connectivity  
-- ✅ Validates MCP server functionality
-- ✅ Lists available tools
-- 🔧 Provides helpful error messages if anything needs fixing
+**Configure Claude Desktop** in `~/Library/Application Support/Claude/claude_desktop_config.json`,
+replacing the path with your actual checkout location:
 
-### 4. Configure Claude Desktop (Only one path to change!)
-
-Add to your Claude Desktop configuration file:
-
-**Config File Location:**
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-
-**Configuration (replace path only):**
 ```json
 {
   "mcpServers": {
     "dayone": {
       "command": "uv",
-      "args": [
-        "--directory",
-        "/FULL/PATH/TO/mcp-dayone",
-        "run",
-        "python",
-        "-m",
-        "mcp_dayone.server"
-      ]
+      "args": ["--directory", "/FULL/PATH/TO/mcp-dayone", "run", "python", "-m", "mcp_dayone.server"]
     }
   }
 }
 ```
 
-**⚠️ Only change needed:** Replace `/FULL/PATH/TO/mcp-dayone` with your actual repository path.
+Restart Claude Desktop afterward. The server is a long-lived process, so it must be
+restarted for any code change to take effect.
 
-### 5. Restart Claude Desktop
+**Invoking tools** happens in natural language: "Create a journal entry about my day",
+"Show me my recent journal entries", "Search my journal for entries about work", "What were
+my journal entries on this day?", "List my Day One journals with entry counts".
 
-After updating the configuration, restart Claude Desktop to load the MCP server.
+**Reading the output.** A creation reports three things: the UUID, a placement line, and a
+sync line. `Placement verified` and `Sync verified` mean everything landed. A `PLACEMENT
+MISMATCH` means the entry exists in the wrong journal — move it manually in the app, and do
+not write again.
 
-### 🎉 **What Makes This Easy:**
+`Sync pending (normal)` is the ordinary result, not a warning. An idle Day One uploads on a
+periodic cycle — 174 seconds measured — so a check bounded at roughly 12 seconds will
+usually still be waiting. It resolves on its own. `Sync UNVERIFIED` means the database could
+not be read in time, which is routine while the app is starting. In every non-`SYNCED` case
+the entry already exists: never write it again, because nothing can delete the duplicate
+programmatically.
 
-- **🔍 Automatic Detection**: Database path, CLI location, all dependencies detected automatically
-- **📦 Zero Dependencies**: `uv sync` handles everything - no manual package installation
-- **🧪 Built-in Validation**: `test_setup.py` ensures everything works before you configure Claude
-- **🛠️ No Code Changes**: Works out-of-the-box for standard Day One installations
-- **📱 Universal Compatibility**: Works with any Day One database and journal setup
-- **🚨 Helpful Errors**: Clear guidance if Day One CLI or database isn't accessible
+## 6. Data Sources
 
-### 🚀 **Ready to Use!**
+No external or networked data sources. All data is local:
 
-Once configured, you can immediately start using natural language commands like:
-- *"Show me my recent journal entries"*
-- *"What were my journal entries on this day?"*
-- *"Create a journal entry about my day"*
+- **Day One CLI** — `/usr/local/bin/dayone`, symlinked into the Day One app bundle. Used for
+  all write operations. Requires the Day One app to be installed.
+- **Day One SQLite database** — `~/Library/Group Containers/5U8NS4GX82.dayoneapp2/Data/Documents/DayOne.sqlite`.
+  Read-only, used for all read and verification operations. Core Data schema with `Z`-prefixed
+  tables (`ZENTRY`, `ZJOURNAL`, `ZREMOTEENTRY`, `ZTAG`). Timestamps are seconds since
+  2001-01-01, so add 978307200 to convert to Unix epoch.
 
-No additional setup, configuration files, or environment variables needed!
+Sync traffic to Day One's servers is handled entirely by the Day One app. This server never
+contacts the network.
 
-## Usage
+## 7. Known Limitations
 
-Once configured, you can interact with Day One through Claude Desktop:
+- **The CLI cannot create journals.** `--journal` requires the journal to already exist;
+  create it in the app first.
+- **Entries cannot be moved or deleted programmatically.** A misplaced entry must be fixed
+  by hand in the Day One app.
+- **Verification is best-effort.** On a cold start — app quit, then a write that launches it
+  — the database is typically unresponsive for the duration of both watchdog budgets, so
+  placement and sync usually report `UNVERIFIED`. This is expected, not an error. When the
+  app is already running, both checks normally succeed in seconds.
+- **Sync verification proves upload, not delivery.** A `SYNCED` verdict means Day One's
+  server acknowledged the entry; it does not prove another device has pulled it yet.
+- **macOS only.** The database path, the `open` command, and the bundled CLI are all
+  macOS-specific.
+- **No automated test suite.** `test_setup.py` validates the environment, not behavior.
 
-## Examples
+## 8. Workarounds
 
-### 📅 **"On This Day" Feature**
+| Limitation | Workaround |
+|---|---|
+| CLI cannot create journals | Create the journal in the Day One app before the first automated write to it |
+| Entries cannot be moved or deleted | Fix placement manually in the app; heed the "do not retry" warning so you are fixing one entry and not two |
+| Cold-start verification returns `UNVERIFIED` | Keep Day One running — add it to System Settings → General → Login Items. Verification then succeeds routinely, and entries sync immediately rather than at next launch |
+| `SYNCED` does not prove delivery | Open Day One on the target device; it pulls on foreground |
+| No automated tests | Run `uv run python test_setup.py` after any environment change |
 
-The MCP server excels at retrieving historical entries for reflection and memory recall:
+## 9. Build Notes
 
-**Query:** *"Show me all my journal entries for 'on this day,' today: June 14th."*
-
-**Result:** Claude automatically:
-1. Uses the `get_entries_by_date` tool to search June 14th across multiple years
-2. Groups entries by year with "X years ago" labels
-3. Shows detailed content previews with timestamps and metadata
-4. Includes entry titles, photos/attachments indicators, and full context
-
-**Example Output:**
-```
-📅 On This Day (06-14) - Found 2 entries:
-
-🗓️ 2023 (2 years ago):
-   • Morning thoughts (8:30 AM) [Personal] - Reflection on summer goals and upcoming 
-     vacation plans. Looking forward to some time off to recharge and spend time with family.
-   
-🗓️ 2021 (4 years ago):
-   • Weekend activities (2:15 PM) [Travel] ⭐ - Great day exploring the local farmers market. 
-     Tried some amazing local honey and picked up fresh ingredients for dinner. This entry 
-     includes photos. #weekend #local #food
-
-No entries found for June 14th in other years (searched back 5 years).
-```
-
-This provides a powerful way to:
-- **Reflect on past experiences** from the same date
-- **Track personal growth** across years
-- **Rediscover forgotten memories** and insights
-- **See patterns** in your life and thinking
-
-### ✍️ **Creating Entries**
-- **"Create a journal entry about my day"** - Creates entry with your content
-- **"Create a starred entry about my vacation with photos from /path/to/photo.jpg"** - Creates entries with attachments and metadata
-- **"Add a journal entry with location coordinates for my current trip"** - Creates location-aware entries
-- **"Add tags #work #meeting to an entry about the team standup"** - Creates tagged entries
-
-### 📖 **Reading & Searching**
-- **"Show me my recent journal entries"** - Displays recent entries with dates, tags, and previews
-- **"Search my journal for entries about work"** - Finds entries containing specific text
-- **"What were my journal entries on this day?"** - **NEW**: Shows "On This Day" entries from previous years
-- **"Show me entries from June 14th in past years"** - **NEW**: Date-specific historical entries
-- **"List my Day One journals with entry counts"** - Shows actual journals and statistics
-- **"How many entries do I have?"** - Gets real entry counts from database
-- **"Find entries from last week"** - Search by date ranges
-
-## Available MCP Tools
-
-### ✍️ **Write Tools (CLI-based)**
-1. **create_journal_entry** - Create entries with rich metadata (attachments, location, tags, etc.)
-2. **create_entry_with_attachments** - Specialized for file attachments (photos, videos, audio, PDFs)
-3. **create_location_entry** - Specialized for location-aware entries with coordinates
-
-### 📖 **Read Tools (Database-based)**
-4. **read_recent_entries** - **NEW**: Read recent journal entries with full metadata
-   - Parameters: limit (1-50), journal (optional filter)
-   - Returns: Formatted entries with dates, tags, previews, starred status
-
-5. **search_entries** - **NEW**: Search entries by text content
-   - Parameters: search_text, limit (1-50), journal (optional filter)
-   - Returns: Matching entries with context and metadata
-
-6. **list_journals_from_db** - **NEW**: List actual journals with statistics
-   - Returns: Journal names, entry counts, last entry dates
-
-7. **get_entry_count_from_db** - **NEW**: Get real entry counts
-   - Parameters: journal (optional filter)
-   - Returns: Actual entry count from database
-
-8. **get_entries_by_date** - **NEW**: Get "On This Day" entries from previous years
-   - Parameters: target_date (MM-DD or YYYY-MM-DD), years_back (default 5)
-   - Returns: Entries from the same date across multiple years with full content
-
-### 📋 **Legacy Tools (CLI limitations)**
-9. **list_journals** - Provides guidance about CLI limitations
-10. **get_entry_count** - Explains CLI counting limitations
-
-## Development
-
-```bash
-# Install development dependencies
-uv sync --dev
-
-# Run the server directly (for testing)
-uv run python -m mcp_dayone.server
-
-# Run tests (when implemented)
-uv run pytest
-```
-
-## Troubleshooting
-
-### Day One CLI Not Found
-- Verify Day One CLI is installed: `dayone2 --version`  
-- Check that `dayone2` is in your PATH
-- Install Day One app and CLI from: https://dayoneapp.com/guides/tips-and-tutorials/command-line-interface-cli
-
-### Claude Desktop Connection Issues
-- Verify the absolute path in `claude_desktop_config.json`
-- Check Claude Desktop logs for MCP server errors
-- Restart Claude Desktop after configuration changes
-
-### Permission Issues
-- Ensure Day One CLI has proper permissions to access your journals
-- Run Day One app once to initialize if needed
-
-### CLI Limitations
-- Day One CLI only supports creating entries (`new` command)
-- Listing journals and counting entries are not supported by the CLI
-- Use the Day One app interface to view journals and entry counts
-- All entry creation features (attachments, location, etc.) work fully
+- **Runtime:** Python 3.11+ (developed and validated against 3.13 via `uv`).
+- **Dependencies:** `mcp>=1.0.0`, `click>=8.0.0`, `pydantic>=2.0.0`. Install with `uv sync`;
+  versions are pinned in `uv.lock`.
+- **Platform:** Validated on macOS 15 (Darwin 25.5) with Day One 2026.16 (build 1774).
+  Not validated on Windows or Linux, and not expected to work there.
+- **No network access required** at build or run time.
+- **Database access is read-only.** The database file belongs to the Day One app; a writable
+  handle buys nothing and risks corrupting app state.
+- **Restart required after code changes.** Claude Desktop keeps the MCP server process alive,
+  so edits do not take effect until Claude Desktop is restarted.
 
 ## License
 
 MIT
-

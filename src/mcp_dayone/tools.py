@@ -3,12 +3,57 @@
 import subprocess
 import json
 import os
+import shutil
 import sqlite3
 import re
+import tempfile
+import threading
+import time
+import weakref
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pathlib import Path
 import shlex
+
+
+# Placement-verification verdicts (see DayOneTools.verify_placement).
+PLACEMENT_OK = "OK"
+PLACEMENT_MISPLACED = "MISPLACED"
+PLACEMENT_UNVERIFIED = "UNVERIFIED"
+
+# Upload-verification verdicts (see DayOneTools.verify_upload).
+UPLOAD_SYNCED = "SYNCED"
+UPLOAD_PENDING = "PENDING"
+UPLOAD_UNVERIFIED = "UNVERIFIED"
+
+# How long a read may wait on the live database before falling back to a snapshot.
+# Kept short on purpose: the point is to avoid a multi-minute stall, not to win the race.
+LIVE_READ_TIMEOUT = 5.0
+
+# Day One's sync engine lives in the MAIN app, not in the always-running
+# com.bloombuilt.dayone-mac-agent. The CLI writes happily with the main app closed, but
+# nothing is uploaded until the main app next launches -- so a scheduled job that writes
+# while the app is quit produces an entry that exists locally and on no other device.
+# Measured 2026-08-14: entry written with the app quit sat unuploaded for 165s; it reached
+# the server 8s after a background launch, with no user interaction.
+DAYONE_BUNDLE_ID = "com.bloombuilt.dayone-mac"
+
+# Seconds to wait for the `open` call itself. Launching is fire-and-forget -- this bounds
+# the subprocess, not the app's startup.
+APP_LAUNCH_TIMEOUT = 10.0
+
+# Hard ceiling on journal-placement verification. See UPLOAD_VERIFY_BUDGET -- same hazard,
+# and create_entry launching the app made it more likely, since the read now frequently
+# lands while Day One is starting up.
+PLACEMENT_VERIFY_BUDGET = 20.0
+
+# Hard ceiling on upload verification, enforced by a watchdog thread rather than by
+# sqlite's own timeout. Observed 2026-08-14: immediately after a write, while the app is
+# starting and syncing, even open(2) on DayOne.sqlite blocks -- a 14-minute stall was
+# measured, and `ls` on the container directory hung too. sqlite's busy_timeout cannot
+# bound that, because the process never gets far enough to acquire a lock. Verification is
+# a convenience; it must never hold up a write that has already succeeded.
+UPLOAD_VERIFY_BUDGET = 15.0
 
 
 class DayOneError(Exception):
@@ -16,10 +61,33 @@ class DayOneError(Exception):
     pass
 
 
+class _SnapshotConnection(sqlite3.Connection):
+    """Read-only connection to a throwaway copy of the database.
+
+    The temp directory has to outlive the connection, so cleanup is tied to the
+    connection's lifetime. It cannot rely on close() alone: the read helpers in this
+    module call conn.close() on the success path only, so an exception mid-query would
+    leak the copy. A finalizer covers that -- the directory is removed when the
+    connection is closed, or when it is garbage collected, whichever happens first.
+    """
+
+    _cleanup = None
+
+    def _bind_temp_dir(self, temp_dir: str) -> None:
+        self._cleanup = weakref.finalize(self, shutil.rmtree, temp_dir, True)
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            if self._cleanup is not None:
+                self._cleanup()
+
+
 class DayOneTools:
     """Wrapper for Day One CLI operations."""
     
-    def __init__(self, cli_path: str = "dayone2"):
+    def __init__(self, cli_path: str = "dayone"):
         self.cli_path = cli_path
         self._verify_cli()
         self.db_path = self._get_db_path()
@@ -45,20 +113,448 @@ class DayOneTools:
         return db_path
     
     def _get_db_connection(self) -> sqlite3.Connection:
-        """Get a connection to the Day One database."""
+        """Get a read-only connection to the Day One database.
+
+        Two things this deliberately does NOT do:
+
+        1. It never opens the database read-write. Every consumer in this module only
+           SELECTs, and the file belongs to the Day One app -- a writable handle buys
+           nothing and risks corrupting the app's state.
+        2. It never waits indefinitely. The app holds write locks while syncing, and a
+           live read blocks behind them even when opened read-only -- measured at 19 s
+           during a routine sync and roughly four minutes immediately after a batch of
+           writes. An MCP call that stalls for minutes is indistinguishable from a hang.
+
+        Strategy: try the live file read-only with a short, bounded wait. That is the
+        common case and costs nothing. If the database is locked, fall back to querying a
+        disposable snapshot, which cannot block. Callers see an ordinary connection either
+        way and do not need to know which path was taken.
+        """
         if not self.db_path.exists():
             raise DayOneError(
                 f"Day One database not found at {self.db_path}. "
                 "Make sure Day One app is installed and has been run at least once."
             )
-        
+
+        # Fast path: the live database, read-only, with a bounded wait.
+        conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro", uri=True, timeout=LIVE_READ_TIMEOUT
+            )
             conn.row_factory = sqlite3.Row  # Enable column access by name
+            conn.execute(f"PRAGMA busy_timeout={int(LIVE_READ_TIMEOUT * 1000)}")
+            # sqlite3.connect() is lazy: it does not touch the file until the first
+            # statement runs. Force the read lock here so contention surfaces now and can
+            # be handled, instead of erupting later inside the caller's query.
+            conn.execute("PRAGMA schema_version").fetchone()
             return conn
-        except sqlite3.Error as e:
-            raise DayOneError(f"Failed to connect to Day One database: {e}")
-    
+        except sqlite3.Error as live_error:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+
+        # Fallback: a throwaway copy, which no other process can lock.
+        temp_dir = tempfile.mkdtemp(prefix="mcp-dayone-read-")
+        try:
+            snapshot = self._snapshot_db(temp_dir)
+            conn = sqlite3.connect(
+                f"file:{snapshot}?mode=ro",
+                uri=True,
+                timeout=LIVE_READ_TIMEOUT,
+                factory=_SnapshotConnection,
+            )
+            conn.row_factory = sqlite3.Row
+            conn._bind_temp_dir(temp_dir)
+            return conn
+        except (OSError, sqlite3.Error) as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise DayOneError(
+                f"Failed to connect to Day One database: {e}. The live database was "
+                "locked and a snapshot could not be read either."
+            )
+
+    def _snapshot_db(self, dest_dir: str) -> str:
+        """Copy the live database plus its WAL/SHM sidecars into dest_dir.
+
+        Reading the live file blocks on the Day One app's write lock even when opened
+        read-only -- observed at 19 seconds during a routine sync and at roughly four
+        minutes immediately after a batch of writes. A scheduled, unattended run that
+        stalls that long is indistinguishable from a hang, so verification always reads
+        a disposable copy instead.
+
+        Copying the `-wal` sidecar is required, not optional: a just-written entry still
+        lives in the write-ahead log and is invisible in a snapshot of the main file alone.
+
+        Returns:
+            Path to the copied database.
+        """
+        dest = os.path.join(dest_dir, "DayOne.sqlite")
+        for suffix in ("", "-wal", "-shm"):
+            source = f"{self.db_path}{suffix}"
+            if os.path.exists(source):
+                shutil.copy2(source, f"{dest}{suffix}")
+        return dest
+
+    def verify_placement(
+        self,
+        entry_uuid: str,
+        expected_journal: Optional[str] = None,
+        attempts: int = 5,
+        delay: float = 2.0,
+        budget: float = PLACEMENT_VERIFY_BUDGET,
+    ) -> Dict[str, Any]:
+        """Check which journal an entry landed in, under a hard time ceiling.
+
+        Same watchdog rationale as verify_upload: a read issued straight after a write can
+        block in open(2) for minutes. That risk rose once create_entry started launching
+        the Day One app, because the read now often lands while the app is starting up.
+
+        Returns:
+            dict as documented on _probe_placement.
+        """
+        box: Dict[str, Any] = {}
+
+        def _run() -> None:
+            box["result"] = self._probe_placement(
+                entry_uuid, expected_journal, attempts, delay
+            )
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(budget)
+
+        if worker.is_alive() or "result" not in box:
+            return {
+                "verdict": PLACEMENT_UNVERIFIED,
+                "uuid": entry_uuid.strip().replace("-", "").upper(),
+                "expected_journal": expected_journal,
+                "actual_journal": None,
+                "detail": (
+                    f"Journal placement could not be read within {int(budget)}s -- the "
+                    "Day One database was unresponsive, which is common while the app is "
+                    "starting up or syncing."
+                ),
+            }
+        return box["result"]
+
+    def _probe_placement(
+        self,
+        entry_uuid: str,
+        expected_journal: Optional[str] = None,
+        attempts: int = 5,
+        delay: float = 2.0,
+    ) -> Dict[str, Any]:
+        """Read back which journal an entry actually landed in.
+
+        The Day One CLI returns a UUID and exit code 0 whenever it creates an entry --
+        including when the entry lands in a journal other than the one `--journal` named.
+        That was observed on 2026-07-30: the requested journal was correct and the entry
+        materialized elsewhere, with nothing in the stack noticing. This method is the
+        read-back that closes that gap.
+
+        Never raises. A verification problem must never be reported as a creation
+        failure, because by this point the entry already exists and any retry would
+        create a duplicate.
+
+        Args:
+            entry_uuid: UUID returned by the CLI. Normalized to undashed uppercase.
+            expected_journal: Journal name that was requested. When None, the actual
+                journal is reported without a pass/fail judgement.
+            attempts: How many times to re-snapshot before giving up.
+            delay: Seconds between attempts, to let a pending commit land.
+
+        Returns:
+            dict with keys: verdict (OK/MISPLACED/UNVERIFIED), uuid, expected_journal,
+            actual_journal, detail.
+        """
+        result: Dict[str, Any] = {
+            "verdict": PLACEMENT_UNVERIFIED,
+            "uuid": entry_uuid,
+            "expected_journal": expected_journal,
+            "actual_journal": None,
+            "detail": "",
+        }
+
+        if not entry_uuid or not re.fullmatch(r"[0-9A-Fa-f-]{32,36}", entry_uuid.strip()):
+            result["detail"] = (
+                "The CLI did not return a recognizable UUID, so placement cannot be "
+                "checked. The entry may still have been created -- check Day One before "
+                "writing again."
+            )
+            return result
+
+        # ZENTRY stores UUIDs undashed and uppercase; the column is ZUUID, not ZIDENTIFIER.
+        uid = entry_uuid.strip().replace("-", "").upper()
+        result["uuid"] = uid
+        sql = (
+            "SELECT z.ZNAME FROM ZENTRY e "
+            "JOIN ZJOURNAL z ON e.ZJOURNAL = z.Z_PK "
+            "WHERE e.ZUUID = ?"
+        )
+
+        last_error = None
+        for attempt in range(attempts):
+            tmp_dir = tempfile.mkdtemp(prefix="mcp-dayone-verify-")
+            try:
+                snapshot = self._snapshot_db(tmp_dir)
+                conn = sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True, timeout=5)
+                try:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    row = conn.execute(sql, (uid,)).fetchone()
+                finally:
+                    conn.close()
+                if row:
+                    result["actual_journal"] = row[0]
+                    break
+            except (OSError, sqlite3.Error) as e:
+                last_error = e
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            if attempt < attempts - 1:
+                time.sleep(delay)
+
+        actual = result["actual_journal"]
+        if actual is None:
+            waited = int(attempts * delay)
+            result["detail"] = (
+                f"No row for this UUID after ~{waited}s"
+                + (f" (last error: {last_error})" if last_error else "")
+                + ". The entry was still created -- do not retry, or it will be duplicated."
+            )
+        elif expected_journal is None:
+            result["verdict"] = PLACEMENT_OK
+            result["detail"] = f'Entry is in "{actual}".'
+        elif actual == expected_journal:
+            result["verdict"] = PLACEMENT_OK
+            result["detail"] = f'Entry is in "{actual}", as requested.'
+        else:
+            result["verdict"] = PLACEMENT_MISPLACED
+            result["detail"] = (
+                f'Entry was created but landed in "{actual}" instead of the requested '
+                f'"{expected_journal}".'
+            )
+        return result
+
+    @staticmethod
+    def describe_placement(placement: Dict[str, Any]) -> str:
+        """Render a verify_placement() result as caller-facing text.
+
+        The wording matters as much as the check. On any non-OK verdict the message has
+        to say plainly that the write SUCCEEDED and must not be retried -- otherwise a
+        caller reads "problem" and retries, which is precisely how a misplaced entry
+        becomes two entries. Day One exposes no programmatic move or delete, so the only
+        real remedy is manual.
+        """
+        verdict = placement.get("verdict")
+        uid = placement.get("uuid")
+        if verdict == PLACEMENT_OK:
+            return f'Placement verified: {placement.get("detail")}'
+        if verdict == PLACEMENT_MISPLACED:
+            return (
+                f'PLACEMENT MISMATCH -- {placement.get("detail")}\n'
+                f"DO NOT retry this write. The entry exists (UUID {uid}); creating it "
+                "again would duplicate it, and a journal-scoped search will not find the "
+                "misplaced original. Day One cannot move entries programmatically -- "
+                "move it manually in the app."
+            )
+        return (
+            f'Placement UNVERIFIED -- {placement.get("detail")}\n'
+            f"Confirm in Day One before writing anything further for UUID {uid}."
+        )
+
+    @staticmethod
+    def ensure_app_running() -> bool:
+        """Launch the Day One main app in the background if it is not already running.
+
+        This is what makes an entry actually reach the user's other devices. The CLI only
+        writes to the local store; the sync engine that uploads it runs inside the main
+        app. A scheduled job firing while the app is quit therefore produces an entry that
+        is invisible everywhere except this Mac, until the user happens to open Day One.
+
+        `-g` keeps the launch in the background so an unattended 6 AM job never steals
+        focus from whatever the user is doing. Launching an already-running app is a
+        no-op, so this is safe to call on every write.
+
+        Never raises. Failing to launch must not turn a successful write into a reported
+        failure -- the entry exists either way, and a retry would duplicate it.
+
+        Returns:
+            True if the launch command succeeded, False otherwise.
+        """
+        try:
+            subprocess.run(
+                ["open", "-g", "-b", DAYONE_BUNDLE_ID],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=APP_LAUNCH_TIMEOUT,
+            )
+            return True
+        except (subprocess.SubprocessError, OSError):
+            return False
+
+    def verify_upload(
+        self,
+        entry_uuid: str,
+        attempts: int = 6,
+        delay: float = 2.0,
+        budget: float = UPLOAD_VERIFY_BUDGET,
+    ) -> Dict[str, Any]:
+        """Check whether an entry reached the sync server, under a hard time ceiling.
+
+        Delegates to _probe_upload on a daemon thread and abandons it if it overruns
+        `budget`. That watchdog is not defensive padding -- a database read issued right
+        after a write can block in open(2) for many minutes (14 measured), which would
+        otherwise stall every journal write by that long. An abandoned thread dies with
+        the process; the temp snapshot it may hold is cleaned up by _SnapshotConnection's
+        finalizer.
+
+        Args:
+            entry_uuid: UUID returned by the CLI.
+            attempts: Re-checks before concluding the upload has not landed.
+            delay: Seconds between attempts.
+            budget: Hard ceiling in seconds across all attempts.
+
+        Returns:
+            dict with keys: verdict (SYNCED/PENDING/UNVERIFIED), uuid, detail.
+        """
+        box: Dict[str, Any] = {}
+
+        def _run() -> None:
+            box["result"] = self._probe_upload(entry_uuid, attempts, delay)
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(budget)
+
+        if worker.is_alive() or "result" not in box:
+            return {
+                "verdict": UPLOAD_UNVERIFIED,
+                "uuid": entry_uuid.strip().replace("-", "").upper(),
+                "detail": (
+                    f"Sync state could not be read within {int(budget)}s -- the Day One "
+                    "database was unresponsive, which is common while the app is starting "
+                    "up or syncing."
+                ),
+            }
+        return box["result"]
+
+    def _probe_upload(
+        self,
+        entry_uuid: str,
+        attempts: int = 6,
+        delay: float = 2.0,
+    ) -> Dict[str, Any]:
+        """Unbounded upload read-back. Call verify_upload() instead, not this directly.
+
+        ZREMOTEENTRY is the app's mirror of what the server has acknowledged. A row in
+        ZENTRY with no matching ZREMOTEENTRY row means the entry was written locally and
+        never uploaded -- the exact failure this check exists to catch, and one that is
+        otherwise completely silent: the CLI returns success, the entry is visible in the
+        Mac app, and only the user's phone knows anything is wrong.
+
+        This can block for minutes on an unresponsive database, which is why verify_upload
+        runs it under a watchdog rather than calling it inline.
+
+        Never raises, for the same reason verify_placement does not: by this point the
+        entry exists, so a verification problem must never be reported as a write failure.
+
+        Args:
+            entry_uuid: UUID returned by the CLI. Normalized to undashed uppercase.
+            attempts: How many times to re-check before giving up.
+            delay: Seconds between attempts. Upload was measured at ~8s from a cold app
+                launch, so ~12s of polling covers the common case.
+
+        Returns:
+            dict with keys: verdict (SYNCED/PENDING/UNVERIFIED), uuid, detail.
+        """
+        result: Dict[str, Any] = {
+            "verdict": UPLOAD_UNVERIFIED,
+            "uuid": entry_uuid,
+            "detail": "",
+        }
+
+        if not entry_uuid or not re.fullmatch(r"[0-9A-Fa-f-]{32,36}", entry_uuid.strip()):
+            result["detail"] = (
+                "The CLI did not return a recognizable UUID, so upload cannot be checked."
+            )
+            return result
+
+        uid = entry_uuid.strip().replace("-", "").upper()
+        result["uuid"] = uid
+
+        last_error = None
+        for attempt in range(attempts):
+            conn = None
+            try:
+                conn = self._get_db_connection()
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM ZREMOTEENTRY WHERE ZUUID = ?", (uid,)
+                ).fetchone()
+                if row and row[0]:
+                    result["verdict"] = UPLOAD_SYNCED
+                    result["detail"] = (
+                        f"Entry reached the Day One sync server after ~{int(attempt * delay)}s."
+                    )
+                    return result
+            except (DayOneError, sqlite3.Error) as e:
+                last_error = e
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+            if attempt < attempts - 1:
+                time.sleep(delay)
+
+        waited = int(attempts * delay)
+        if last_error is not None:
+            result["detail"] = f"Could not read sync state after ~{waited}s: {last_error}"
+            return result
+
+        result["verdict"] = UPLOAD_PENDING
+        result["detail"] = (
+            f"Entry is stored locally but the sync server has not acknowledged it after "
+            f"~{waited}s."
+        )
+        return result
+
+    @staticmethod
+    def describe_upload(upload: Dict[str, Any]) -> str:
+        """Render a verify_upload() result as caller-facing text.
+
+        As with describe_placement, the wording has to keep a caller from "fixing" a sync
+        delay by writing the entry again. Upload is asynchronous: PENDING frequently just
+        means the push had not finished within the check budget, and it resolves on its
+        own. Re-writing would duplicate the entry permanently.
+        """
+        verdict = upload.get("verdict")
+        uid = upload.get("uuid")
+        if verdict == UPLOAD_SYNCED:
+            return f'Sync verified: {upload.get("detail")}'
+        if verdict == UPLOAD_PENDING:
+            # PENDING is the ordinary outcome, not a warning. An idle Day One uploads on a
+            # periodic cycle -- 174s measured on 2026-08-14 -- so a check bounded at ~12s
+            # will normally still be waiting. Phrasing this as a problem would put a false
+            # alarm on nearly every capture, and the one thing a caller must not do in
+            # response is write the entry again.
+            return (
+                f'Sync pending (normal): {upload.get("detail")} '
+                "An idle Day One uploads on a periodic cycle, so this usually resolves on "
+                "its own within a few minutes. No action needed, and do not write the "
+                "entry again."
+            )
+        return (
+            f'Sync UNVERIFIED -- {upload.get("detail")}\n'
+            f"The entry itself was created (UUID {uid}). Do not write it again; check Day "
+            "One directly. If entries never sync, confirm the Day One app is running -- "
+            "its sync engine does not run while the app is quit."
+        )
+
     def create_entry(
         self,
         content: str,
@@ -154,6 +650,13 @@ class DayOneTools:
                 check=True
             )
             
+            # The write only reached the local store. Day One's sync engine runs inside
+            # the main app, so unless that app is running this entry will not reach any
+            # other device -- silently, and for as long as the app stays closed. Launching
+            # it here (backgrounded, no-op if already running) is what makes a scheduled,
+            # unattended write actually sync.
+            self.ensure_app_running()
+
             # Extract UUID from output
             output = result.stdout.strip()
             if "Created new entry with uuid:" in output:
@@ -161,7 +664,7 @@ class DayOneTools:
                 return uuid
             else:
                 return output
-                
+
         except subprocess.CalledProcessError as e:
             raise DayOneError(f"Failed to create entry: {e.stderr}")
     

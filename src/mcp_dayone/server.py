@@ -145,9 +145,15 @@ async def handle_create_journal_entry(args: CreateEntryArgs) -> list[TextContent
             timezone=args.timezone if args.timezone else None,
             all_day=args.all_day if args.all_day else None,
         )
+        placement = dayone_tools.verify_placement(uuid, args.journal if args.journal else None)
+        upload = dayone_tools.verify_upload(uuid)
         return [TextContent(
             type="text",
-            text=f"Successfully created journal entry with UUID: {uuid}"
+            text=(
+                f"Successfully created journal entry with UUID: {uuid}\n"
+                f"{dayone_tools.describe_placement(placement)}\n"
+                f"{dayone_tools.describe_upload(upload)}"
+            )
         )]
     except DayOneError as e:
         return [TextContent(
@@ -198,9 +204,15 @@ async def handle_create_entry_with_attachments(args: CreateEntryWithAttachmentsA
             starred=args.starred if args.starred else None,
         )
         attachment_count = len(args.attachments)
+        placement = dayone_tools.verify_placement(uuid, args.journal if args.journal else None)
+        upload = dayone_tools.verify_upload(uuid)
         return [TextContent(
             type="text",
-            text=f"Successfully created journal entry with {attachment_count} attachment(s). UUID: {uuid}"
+            text=(
+                f"Successfully created journal entry with {attachment_count} attachment(s). UUID: {uuid}\n"
+                f"{dayone_tools.describe_placement(placement)}\n"
+                f"{dayone_tools.describe_upload(upload)}"
+            )
         )]
     except DayOneError as e:
         return [TextContent(
@@ -222,9 +234,15 @@ async def handle_create_location_entry(args: CreateLocationEntryArgs) -> list[Te
             journal=args.journal if args.journal else None,
             starred=args.starred if args.starred else None,
         )
+        placement = dayone_tools.verify_placement(uuid, args.journal if args.journal else None)
+        upload = dayone_tools.verify_upload(uuid)
         return [TextContent(
             type="text",
-            text=f"Successfully created location entry at {args.latitude}, {args.longitude}. UUID: {uuid}"
+            text=(
+                f"Successfully created location entry at {args.latitude}, {args.longitude}. UUID: {uuid}\n"
+                f"{dayone_tools.describe_placement(placement)}\n"
+                f"{dayone_tools.describe_upload(upload)}"
+            )
         )]
     except DayOneError as e:
         return [TextContent(
