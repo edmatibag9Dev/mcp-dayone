@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased] — 2026-09-17
+
+### Fixed
+
+- **Tool calls that omitted optional arguments failed with "expected nonoptional".** Since
+  2026-09-16, Claude sessions rejected any omitted argument whose published JSON Schema carried a
+  `default` — for example `get_entry_count_from_db` with no `journal`, and `create_journal_entry`
+  without `date`, `attachments`, `starred`, `coordinates`, `timezone` and `all_day`. Reproduced
+  2026-09-17: the call failed without the argument and succeeded with it. The server itself was
+  never at fault — a direct stdio call with `{}` succeeds. `get_available_tools()` now publishes
+  each schema through `published_schema()`, which removes every `default` key and appends the
+  value to the description. The Pydantic models keep their defaults, so omitted arguments resolve
+  exactly as before.
+- **Root cause, not confirmed:** the Claude desktop app's bridge for local MCP servers. The Open
+  Brain server (TypeScript, Supabase) failed identically and was fixed the same way the same day.
+- Added `tests/test_published_schema.py`, verified to fail on the pre-fix server and pass after.
+  End-to-end stdio check: 10 tools, 0 published `default` keys, `get_entry_count_from_db` with `{}`
+  returns the total. Takes effect after Claude Desktop restarts.
+
 ## [Unreleased] — 2026-08-14
 
 ### Fixed

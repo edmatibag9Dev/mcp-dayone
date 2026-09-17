@@ -76,58 +76,77 @@ class GetEntriesByDateArgs(BaseModel):
 # Global Day One tools instance
 dayone_tools: DayOneTools = None
 
+def published_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """JSON Schema for a tool's arguments with every "default" key removed.
+
+    The Pydantic models keep their defaults, so omitted arguments still resolve
+    server-side. Only the published schema drops them: on 2026-09-16 the Claude
+    desktop app began rejecting any omitted argument whose schema declared a
+    default ("expected nonoptional"). The default value moves into the
+    description so callers can still see it.
+    """
+    schema = model.model_json_schema()
+    for prop in schema.get("properties", {}).values():
+        if "default" in prop:
+            default = prop.pop("default")
+            desc = prop.get("description", "")
+            if "default" not in desc.lower():
+                prop["description"] = f"{desc} (default {default!r})".strip()
+    return schema
+
+
 def get_available_tools() -> list[Tool]:
     """Get list of available MCP tools."""
     return [
         Tool(
             name="create_journal_entry",
             description="Create a new entry in Day One journal with support for attachments, location, and metadata",
-            inputSchema=CreateEntryArgs.model_json_schema(),
+            inputSchema=published_schema(CreateEntryArgs),
         ),
         Tool(
             name="list_journals",
             description="List all available Day One journals",
-            inputSchema=ListJournalsArgs.model_json_schema(),
+            inputSchema=published_schema(ListJournalsArgs),
         ),
         Tool(
             name="get_entry_count",
             description="Get the total number of entries in a journal",
-            inputSchema=GetEntryCountArgs.model_json_schema(),
+            inputSchema=published_schema(GetEntryCountArgs),
         ),
         Tool(
             name="create_entry_with_attachments",
             description="Create a journal entry with file attachments (photos, videos, audio, PDFs)",
-            inputSchema=CreateEntryWithAttachmentsArgs.model_json_schema(),
+            inputSchema=published_schema(CreateEntryWithAttachmentsArgs),
         ),
         Tool(
             name="create_location_entry",
             description="Create a journal entry with location coordinates",
-            inputSchema=CreateLocationEntryArgs.model_json_schema(),
+            inputSchema=published_schema(CreateLocationEntryArgs),
         ),
         Tool(
             name="read_recent_entries",
             description="Read recent journal entries from Day One database",
-            inputSchema=ReadRecentEntriesArgs.model_json_schema(),
+            inputSchema=published_schema(ReadRecentEntriesArgs),
         ),
         Tool(
             name="search_entries",
             description="Search journal entries by text content",
-            inputSchema=SearchEntriesArgs.model_json_schema(),
+            inputSchema=published_schema(SearchEntriesArgs),
         ),
         Tool(
             name="list_journals_from_db",
             description="List all journals from database with entry counts",
-            inputSchema=ListJournalsFromDbArgs.model_json_schema(),
+            inputSchema=published_schema(ListJournalsFromDbArgs),
         ),
         Tool(
             name="get_entry_count_from_db",
             description="Get actual entry count from Day One database",
-            inputSchema=GetEntryCountFromDbArgs.model_json_schema(),
+            inputSchema=published_schema(GetEntryCountFromDbArgs),
         ),
         Tool(
             name="get_entries_by_date",
             description="Get journal entries for a specific date across multiple years ('On This Day' feature)",
-            inputSchema=GetEntriesByDateArgs.model_json_schema(),
+            inputSchema=published_schema(GetEntriesByDateArgs),
         ),
     ]
 

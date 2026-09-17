@@ -65,11 +65,13 @@ write-ahead log and is invisible in a copy of the main file alone.
 ## 4. File Descriptions
 
 ```
-src/mcp_dayone/server.py   — MCP server: tool schemas and the 10 request handlers
+src/mcp_dayone/server.py   — MCP server: tool schemas and the 10 request handlers; published
+                             schemas carry no "default" keys (see published_schema)
 src/mcp_dayone/tools.py    — DayOneTools: CLI wrapper, database reads, text extraction,
                              placement/upload verification, app-launch logic
 src/mcp_dayone/__init__.py — Package marker
 test_setup.py              — Setup validation: CLI reachable, database readable, tools listed
+tests/test_published_schema.py — Regression guard: no tool publishes a schema default; models still default
 pyproject.toml             — Project metadata and Python dependencies
 uv.lock                    — Pinned dependency versions
 smithery.toml              — Smithery packaging configuration
@@ -156,7 +158,13 @@ contacts the network.
   server acknowledged the entry; it does not prove another device has pulled it yet.
 - **macOS only.** The database path, the `open` command, and the bundled CLI are all
   macOS-specific.
-- **No automated test suite.** `test_setup.py` validates the environment, not behavior.
+- **Only a narrow automated test.** `test_setup.py` validates the environment; `tests/test_published_schema.py`
+  guards the published tool schemas. Handler behavior is not unit-tested.
+- **Omitted optional arguments were rejected 2026-09-16 → 2026-09-17** in Claude sessions
+  ("expected nonoptional"). Root cause, not confirmed: the Claude desktop app mishandling JSON
+  Schema `default` for local MCP servers. Fixed here by publishing schemas without `default`
+  keys; the Pydantic models still apply the defaults. A running session keeps the old schema
+  until Claude Desktop is restarted.
 
 ## 8. Workarounds
 
@@ -166,7 +174,8 @@ contacts the network.
 | Entries cannot be moved or deleted | Fix placement manually in the app; heed the "do not retry" warning so you are fixing one entry and not two |
 | Cold-start verification returns `UNVERIFIED` | Keep Day One running — add it to System Settings → General → Login Items. Verification then succeeds routinely, and entries sync immediately rather than at next launch |
 | `SYNCED` does not prove delivery | Open Day One on the target device; it pulls on foreground |
-| No automated tests | Run `uv run python test_setup.py` after any environment change |
+| Narrow automated tests | Run `uv run python test_setup.py` after any environment change and `uv run python -m unittest tests/test_published_schema.py` after any schema change |
+| "expected nonoptional" on a tool call | Restart Claude Desktop so it reloads the schemas; until then pass the optional arguments explicitly |
 
 ## 9. Build Notes
 
